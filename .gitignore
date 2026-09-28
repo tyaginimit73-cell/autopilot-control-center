@@ -1,0 +1,16 @@
+node_modules/
+.next/
+out/
+dist/
+coverage/
+*.log
+
+.env
+.env.local
+.env.*.local
+
+.pki/
+.sudo_as_admin_successful
+
+.DS_Store
+Thumbs.db
