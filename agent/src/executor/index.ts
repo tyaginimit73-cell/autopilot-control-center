@@ -1,18 +1,22 @@
 import { validate, type AgentCommand, type Profile } from "../security/allowlist.js";
 import type { AgentStore } from "../state/store.js";
 import type { ControlPlaneClient } from "../transport/client.js";
+import { createDrivers, DriverAbort, DriverError, releaseAllDrivers } from "../drivers/index.js";
+import type { InputDrivers, MouseButton, ScrollDirection } from "../drivers/index.js";
 
 /**
- * Phase-1 command executor: DRY-RUN ONLY.
+ * Command executor (Phase 3: dry-run + real Windows mouse/keyboard).
  *
  * Pipeline: parse → allowlist-validate → halt/dedup checks → dry-run gate →
- * honest result → POST /api/agent/result (retried, idempotent).
+ * dry-run describe OR live driver execution → honest result →
+ * POST /api/agent/result (retried, idempotent).
  *
- * There are intentionally no driver imports in this file. A command with
- * `dryRun: false` can therefore never produce a physical effect: it is rejected
- * with a clear "not supported in Phase 1" result. `DRY_RUN=1` in the agent env
- * additionally forces every command down the dry-run path even if the server
- * asked for a live run.
+ * The executor holds ONLY the abstract `InputDrivers` interfaces — there are
+ * no OS/native imports in this file. `dryRun: true` therefore still cannot
+ * produce a physical effect by construction (it never touches the drivers).
+ * Live mouse/keyboard commands dispatch through the driver layer, which owns
+ * all Windows-specific details, argument re-validation and cleanup.
+ * `DRY_RUN=1` in the agent env still refuses every live run outright.
  */
 
 export interface AgentCommandResult {
@@ -30,8 +34,23 @@ export interface ExecutorOptions {
   profiles: Profile[];
   /** agent-side DRY_RUN env flag: when true, live runs are refused outright */
   forceDryRun: boolean;
+  /** input drivers (default: resolved from MOUSE_DRIVER/KEYBOARD_DRIVER) */
+  drivers?: InputDrivers;
   log?: (message: string) => void;
 }
+
+/** Action types with a real Phase-3 driver behind them. Everything else live is refused. */
+const LIVE_INPUT_TYPES: ReadonlySet<string> = new Set([
+  "MOVE_MOUSE",
+  "CLICK_MOUSE",
+  "DOUBLE_CLICK_MOUSE",
+  "RIGHT_CLICK_MOUSE",
+  "SCROLL_MOUSE",
+  "DRAG_MOUSE",
+  "TYPE_TEXT",
+  "PRESS_KEY",
+  "HOTKEY",
+]);
 
 const RESULT_MESSAGE_LIMIT = 500;
 
@@ -44,7 +63,11 @@ export class CommandExecutor {
   private tail: Promise<void> = Promise.resolve();
   private epoch = 0;
 
-  constructor(private readonly opts: ExecutorOptions) {}
+  private readonly drivers: InputDrivers;
+
+  constructor(private readonly opts: ExecutorOptions) {
+    this.drivers = opts.drivers ?? createDrivers({ mouse: "auto", keyboard: "auto" });
+  }
 
   get halted(): boolean {
     return this.opts.store.halted;
@@ -59,14 +82,18 @@ export class CommandExecutor {
   }
 
   /**
-   * Emergency stop: cancel everything still queued, halt the executor, and mark
-   * state IDLE. In Phase 1 there is no physical automation to stop, so this only
-   * affects queued/reported dry-run work. A reconnect (fresh `hello`) clears the
+   * Emergency stop: cancel everything still queued, halt the executor, mark
+   * state IDLE, and release any held mouse button / keyboard modifiers. The
+   * serial queue means the stop lands between commands; the in-flight live
+   * command (if any) observes the halt via its abort checker and unwinds
+   * through driver try/finally cleanup. A reconnect (fresh `hello`) clears the
    * halt; until then every command is rejected with a clear reason.
+   * Idempotent: releaseAll never throws, so repeated stops are safe.
    */
   emergencyStop(reason: string) {
     this.epoch += 1;
     this.opts.store.onEmergencyStop(reason);
+    releaseAllDrivers(this.drivers);
     this.opts.log?.(`[agent] EMERGENCY STOP — executor halted (${reason}); reconnect or restart to resume`);
   }
 
@@ -105,8 +132,9 @@ export class CommandExecutor {
       return;
     }
 
-    // 4. Dry-run gate — the Phase-1 safety invariant. No drivers exist, so a live
-    // command is answered honestly instead of executed.
+    // 4. Dry-run gate. DRY_RUN=1 still refuses every live run outright. A live
+    // command for mouse/keyboard dispatches to the driver layer; any other
+    // live action (browser, window, control-flow) is answered honestly.
     if (this.opts.forceDryRun && !command.dryRun) {
       this.opts.store.stats.commandsRejected += 1;
       await this.deliver(
@@ -115,13 +143,7 @@ export class CommandExecutor {
       return;
     }
     if (!command.dryRun) {
-      this.opts.store.stats.commandsRejected += 1;
-      await this.deliver(
-        fail(
-          command.id,
-          `unsupported in Phase 1: live ${command.type} execution needs OS drivers that are not installed yet (re-send with dryRun:true)`,
-        ),
-      );
+      await this.executeLive(command, receivedAt, epoch, fail);
       return;
     }
 
@@ -140,6 +162,66 @@ export class CommandExecutor {
         durationMs: Math.max(0, Date.now() - execStarted),
         data: { dryRun: true, phase: 1, queueWaitMs: Math.max(0, execStarted - receivedAt) },
       });
+    } finally {
+      this.opts.store.automation = "IDLE";
+    }
+  }
+
+  /**
+   * Step 4b — live execution through the driver layer. Halt state is re-checked
+   * immediately before real input; the drivers also observe aborts cooperatively
+   * between sub-steps. Results are structured and secret-free: typed text is
+   * reported as a length only, failures carry a safe code, and OS stacks never
+   * leave the agent.
+   */
+  private async executeLive(
+    command: AgentCommand,
+    receivedAt: number,
+    epoch: number,
+    fail: (commandId: string, message: string) => AgentCommandResult,
+  ) {
+    if (!LIVE_INPUT_TYPES.has(command.type)) {
+      this.opts.store.stats.commandsRejected += 1;
+      await this.deliver(
+        fail(
+          command.id,
+          `unsupported: live ${command.type} has no Phase-3 driver yet (mouse/keyboard only — re-send with dryRun:true to simulate)`,
+        ),
+      );
+      return;
+    }
+    // Re-check the halt immediately before touching real input (§8).
+    if (epoch !== this.epoch || this.opts.store.halted) {
+      this.opts.store.stats.commandsRejected += 1;
+      await this.deliver(
+        fail(command.id, "cancelled: emergency stop is active (reconnect or restart the agent to resume)"),
+      );
+      return;
+    }
+    const aborted = () => epoch !== this.epoch || this.opts.store.halted;
+    const execStarted = Date.now();
+    this.opts.store.automation = "RUNNING";
+    try {
+      dispatchLive(this.drivers, command, aborted);
+      this.opts.store.stats.commandsCompleted += 1;
+      await this.deliver({
+        commandId: command.id,
+        ok: true,
+        message: truncate(describeLive(command)),
+        durationMs: Math.max(0, Date.now() - execStarted),
+        data: { dryRun: false, phase: 3, queueWaitMs: Math.max(0, execStarted - receivedAt) },
+      });
+    } catch (error) {
+      this.opts.store.stats.commandsRejected += 1;
+      if (error instanceof DriverAbort) {
+        await this.deliver(
+          fail(command.id, "cancelled: emergency stop is active (reconnect or restart the agent to resume)"),
+        );
+        return;
+      }
+      const code = error instanceof DriverError ? error.code : "DRIVER_ERROR";
+      const detail = error instanceof Error ? error.message : String(error);
+      await this.deliver(fail(command.id, `live ${command.type} failed [${code}]: ${detail}`));
     } finally {
       this.opts.store.automation = "IDLE";
     }
@@ -172,6 +254,85 @@ function extractId(raw: unknown): string | null {
     return id.length >= 1 && id.length <= 64 ? id : null;
   }
   return null;
+}
+
+/**
+ * Thin dispatch from validated live commands to driver methods. This function
+ * performs NO OS calls itself and NO re-validation beyond protocol defaults —
+ * the driver layer owns argument checks, abort handling and cleanup. Missing
+ * numerics fall through as NaN so the driver rejects them as INVALID_ARGUMENT
+ * (allowlist + server schemas normally guarantee their presence).
+ */
+function dispatchLive(drivers: InputDrivers, command: AgentCommand, aborted: () => boolean): void {
+  const p = command.parameters;
+  switch (command.type) {
+    case "MOVE_MOUSE":
+      drivers.mouse.move(p.x ?? NaN, p.y ?? NaN, { durationMs: p.durationMs, aborted });
+      return;
+    case "CLICK_MOUSE": {
+      const at = typeof p.x === "number" && typeof p.y === "number" ? { x: p.x, y: p.y } : undefined;
+      drivers.mouse.click((p.button ?? "left") as MouseButton, { at, aborted });
+      return;
+    }
+    case "DOUBLE_CLICK_MOUSE":
+      drivers.mouse.doubleClick({ aborted });
+      return;
+    case "RIGHT_CLICK_MOUSE":
+      drivers.mouse.rightClick({ aborted });
+      return;
+    case "SCROLL_MOUSE":
+      drivers.mouse.scroll((p.direction ?? "down") as ScrollDirection, p.amount ?? 3, { aborted });
+      return;
+    case "DRAG_MOUSE":
+      drivers.mouse.drag(p.x ?? NaN, p.y ?? NaN, p.toX ?? NaN, p.toY ?? NaN, { durationMs: p.durationMs, aborted });
+      return;
+    case "TYPE_TEXT":
+      drivers.keyboard.typeText(p.text ?? "", { delayMs: p.delayMs, aborted });
+      return;
+    case "PRESS_KEY":
+      drivers.keyboard.pressKey(p.key ?? "", { modifiers: p.modifiers, aborted });
+      return;
+    case "HOTKEY":
+      drivers.keyboard.hotkey(p.modifiers ?? [], p.key ?? "", { aborted });
+      return;
+    default:
+      // Unreachable: executeLive gates on LIVE_INPUT_TYPES. Belt and braces.
+      throw new DriverError("INVALID_ARGUMENT", `no live driver for ${command.type}`);
+  }
+}
+
+/**
+ * Human-readable live-execution summaries. Like the dry-run descriptions,
+ * secret-bearing fields are NEVER echoed: typed text is reported by length
+ * only. Coordinates and allowlisted key names are safe metadata.
+ */
+function describeLive(command: AgentCommand): string {
+  const p = command.parameters as Record<string, unknown>;
+  const num = (value: unknown): string => (typeof value === "number" ? String(value) : "?");
+  switch (command.type) {
+    case "MOVE_MOUSE":
+      return `[LIVE] MOVE_MOUSE executed → ${num(p.x)},${num(p.y)}`;
+    case "CLICK_MOUSE":
+      return `[LIVE] CLICK_MOUSE executed (${String(p.button ?? "left")} button)`;
+    case "DOUBLE_CLICK_MOUSE":
+      return "[LIVE] DOUBLE_CLICK_MOUSE executed (left button)";
+    case "RIGHT_CLICK_MOUSE":
+      return "[LIVE] RIGHT_CLICK_MOUSE executed";
+    case "SCROLL_MOUSE":
+      return `[LIVE] SCROLL_MOUSE executed (${String(p.direction ?? "down")} ×${num(p.amount ?? 3)})`;
+    case "DRAG_MOUSE":
+      return `[LIVE] DRAG_MOUSE executed (${num(p.x)},${num(p.y)} → ${num(p.toX)},${num(p.toY)})`;
+    case "TYPE_TEXT":
+      return `[LIVE] TYPE_TEXT executed (${typeof p.text === "string" ? p.text.length : 0} chars)`;
+    case "PRESS_KEY":
+      return `[LIVE] PRESS_KEY executed (${String(p.key ?? "?")})`;
+    case "HOTKEY": {
+      const mods = Array.isArray(p.modifiers) ? p.modifiers.join("+") : "";
+      return `[LIVE] HOTKEY executed (${mods ? `${mods}+` : ""}${String(p.key ?? "?")})`;
+    }
+    default:
+      return `[LIVE] ${command.type} executed`;
+  }
 }
 
 /**

@@ -26,7 +26,7 @@ const dry = (id: string, type: string, parameters: Record<string, unknown> = {})
   dryRun: true,
 });
 
-describe("CommandExecutor (Phase 1 dry-run)", () => {
+describe("CommandExecutor (dry-run + live dispatch)", () => {
   it("reports honest dry-run results without echoing typed text", async () => {
     const { posted, executor, flush } = harness();
     executor.handle(dry("t1", "TYPE_TEXT", { text: "s3cr3t-p4ssw0rd" }));
@@ -40,13 +40,13 @@ describe("CommandExecutor (Phase 1 dry-run)", () => {
     assert.ok(posted[0].body.durationMs >= 0);
   });
 
-  it("refuses live commands when no drivers exist", async () => {
+    it("live input without loadable drivers fails guided, not silently (Phase 3 contract)", async () => {
     const { posted, executor, flush } = harness();
     executor.handle({ id: "live1", type: "MOVE_MOUSE", parameters: { x: 1, y: 1 }, timeoutMs: 5000, dryRun: false });
     await flush();
     assert.equal(posted.length, 1);
     assert.equal(posted[0].body.ok, false);
-    assert.match(posted[0].body.message, /Phase 1/);
+    assert.match(posted[0].body.message, /\[DRIVER_UNAVAILABLE\]/);
   });
 
   it("refuses live commands when DRY_RUN=1 even if requested", async () => {

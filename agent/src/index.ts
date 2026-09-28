@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 /**
- * AutoPilot Windows agent — Phase 1 entrypoint.
+ * AutoPilot Windows agent — Phase 3 entrypoint.
  *
- * DRY-RUN ONLY: this agent connects, pairs, heartbeats, receives commands and
- * reports honest dry-run results. It contains no mouse/keyboard/window/browser
- * drivers, so a physical effect is impossible by construction.
+ * This agent connects, pairs, heartbeats, receives commands and reports honest
+ * results. `dryRun: true` commands are simulated only (physical effects
+ * impossible by construction — the dry-run path never touches the drivers).
+ * `dryRun: false` mouse/keyboard commands execute REAL desktop input through
+ * the driver layer (`./drivers`) on a supported Windows agent.
  *
  *   npm run dev          # tsx watch (development)
  *   npm start            # node dist/index.js (production)
@@ -13,6 +15,7 @@
  * Credentials resolve via loadRuntimeConfig: secure store → environment.
  */
 import { config, loadRuntimeConfig } from "./config/index.js";
+import { createDrivers, releaseAllDrivers } from "./drivers/index.js";
 import { AgentStore } from "./state/store.js";
 import { CommandExecutor } from "./executor/index.js";
 import { ControlPlaneClient } from "./transport/client.js";
@@ -69,7 +72,8 @@ async function main() {
     );
   }
 
-  log(`[agent] starting (phase-1 dry-run) → ${runtime.serverUrl} · device=${deviceId.slice(0, 8)}… · DRY_RUN=${config.dryRun ? "1" : "0"} · creds=${runtime.credentialBackend}`);
+  const drivers = createDrivers({ mouse: config.drivers.mouse, keyboard: config.drivers.keyboard });
+  log(`[agent] starting (phase-3 input) → ${runtime.serverUrl} · device=${deviceId.slice(0, 8)}… · DRY_RUN=${config.dryRun ? "1" : "0"} · creds=${runtime.credentialBackend} · input=${drivers.describe()}`);
   if (config.applicationProfiles.length) {
     log(`[agent] local application profiles: ${config.applicationProfiles.length} configured`);
   } else {
@@ -78,7 +82,7 @@ async function main() {
 
   const store = new AgentStore();
   const client = new ControlPlaneClient(runtime.serverUrl, () => token);
-  const executor = new CommandExecutor({ client, store, profiles: config.applicationProfiles, forceDryRun: config.dryRun, log });
+  const executor = new CommandExecutor({ client, store, profiles: config.applicationProfiles, forceDryRun: config.dryRun, drivers, log });
   const reporter = new Reporter({ client, store, heartbeatMs: config.heartbeatMs, stateMs: config.stateReportMs, log });
   const events = new SseConnection({
     baseUrl: runtime.serverUrl,
@@ -114,6 +118,7 @@ async function main() {
     log(`[agent] ${signal} received — shutting down…`);
     await events.stop().catch(() => undefined);
     reporter.stop();
+    releaseAllDrivers(drivers);
     const snapshot = store.snapshot();
     log(
       `[agent] stopped. commands: received=${snapshot.stats.commandsReceived} completed=${snapshot.stats.commandsCompleted} ` +
