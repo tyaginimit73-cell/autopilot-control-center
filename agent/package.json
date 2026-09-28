@@ -7,12 +7,12 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "start": "tsx src/index.ts",
-    "pair": "tsx src/cli.ts pair",
-    "save-token": "tsx src/cli.ts save-token",
-    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "pair": "node dist/cli.js pair",
+    "save-token": "node dist/cli.js save-token",
+    "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test dist/test"
+    "test": "tsx --test src/test/*.test.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

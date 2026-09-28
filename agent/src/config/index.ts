@@ -2,7 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import dotenv from "dotenv";
 
-dotenv.config({ path: path.join(process.cwd(), ".env") });
+export function resolveEnvFile(): string {
+  return path.join(process.cwd(), ".env");
+}
+
+dotenv.config({ path: resolveEnvFile() });
 
 export interface AgentConfig {
   serverUrl: string;
@@ -56,8 +60,16 @@ function loadLocalProfiles(): ApplicationProfile[] {
   }
 }
 
+function cleanServerUrl(value: string | undefined): string {
+  const trimmed = (value ?? "http://localhost:3000").trim().replace(/\/+$/, "");
+  if (!/^https?:\/\//i.test(trimmed)) {
+    throw new Error(`SERVER_URL must start with http(s):// (got "${value ?? ""}")`);
+  }
+  return trimmed;
+}
+
 export const config: AgentConfig = {
-  serverUrl: (process.env.SERVER_URL ?? "http://localhost:4000").replace(/\/+$/, ""),
+  serverUrl: cleanServerUrl(process.env.SERVER_URL),
   deviceToken: process.env.DEVICE_TOKEN || null,
   deviceId: process.env.DEVICE_ID || null,
   dryRun: bool(process.env.DRY_RUN, false),
