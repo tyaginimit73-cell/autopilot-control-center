@@ -1,4 +1,4 @@
-import { asc, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, gt } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/db";
 import { activityLogs, applicationProfiles, devices, workflows } from "@/db/schema";
@@ -108,11 +108,14 @@ export const deviceHandlers = {
   /* ── agent pairing handshake (no user session) ─────────────────────────── */
   async agentPair(ctx: Ctx) {
     const input = await ctx.body(agentPairSchema);
-    const [row] = await db.select().from(devices).where(eq(devices.pairingCode, input.pairingCode.toUpperCase()));
-    if (!row || !row.pairingExpiresAt || row.pairingExpiresAt < new Date()) {
+    const code = input.pairingCode.toUpperCase();
+    const [row] = await db.select().from(devices).where(eq(devices.pairingCode, code));
+    if (!row) {
       throw new ApiError(400, "Pairing failed: the code is invalid, expired, or already used.");
     }
     const { token, tokenHash } = generateDeviceToken(row.id);
+    // The consume is atomic: the UPDATE only matches while the code is still
+    // present and unexpired, so two concurrent pair attempts cannot both win.
     const [updated] = await db
       .update(devices)
       .set({
@@ -127,8 +130,11 @@ export const deviceHandlers = {
         status: "OFFLINE",
         updatedAt: new Date(),
       })
-      .where(eq(devices.id, row.id))
+      .where(and(eq(devices.id, row.id), eq(devices.pairingCode, code), gt(devices.pairingExpiresAt, new Date())))
       .returning();
+    if (!updated) {
+      throw new ApiError(400, "Pairing failed: the code is invalid, expired, or already used.");
+    }
     await log({ userId: row.userId, deviceId: row.id, level: "SUCCESS", message: `${input.deviceName} paired (agent ${input.agentVersion}, ${input.platform})` });
     return json({ deviceId: updated.id, deviceToken: token, userId: updated.userId }, { status: 201 });
   },

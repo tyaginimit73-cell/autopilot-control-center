@@ -27,6 +27,8 @@ const INTEGRATION = [
   "./integration/agent-online.test",
   "./integration/pending-scope.test",
   "./integration/dryrun-workflow.test",
+  "./integration/pairing-security.test",
+  "./integration/agent-auth.test",
 ];
 
 interface TestModule {

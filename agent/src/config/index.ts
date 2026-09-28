@@ -1,12 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import dotenv from "dotenv";
+import { loadCredentials, resolveCredentialStore } from "../credentials/store.js";
 
-export function resolveEnvFile(): string {
-  return path.join(process.cwd(), ".env");
-}
+/** Legacy .env path (re-exported; defined alongside the credential helpers). */
+export { resolveEnvFile } from "../credentials/store.js";
 
-dotenv.config({ path: resolveEnvFile() });
+dotenv.config({ path: path.join(process.cwd(), ".env") });
 
 export interface AgentConfig {
   serverUrl: string;
@@ -60,7 +60,7 @@ function loadLocalProfiles(): ApplicationProfile[] {
   }
 }
 
-function cleanServerUrl(value: string | undefined): string {
+export function cleanServerUrl(value: string | undefined): string {
   const trimmed = (value ?? "http://localhost:3000").trim().replace(/\/+$/, "");
   if (!/^https?:\/\//i.test(trimmed)) {
     throw new Error(`SERVER_URL must start with http(s):// (got "${value ?? ""}")`);
@@ -92,3 +92,41 @@ export const config: AgentConfig = {
   },
   applicationProfiles: loadLocalProfiles(),
 };
+
+export interface RuntimeConfig {
+  serverUrl: string;
+  deviceToken: string | null;
+  deviceId: string | null;
+  credentialBackend: "file" | "keychain" | "env" | null;
+  credentialLocation: string;
+}
+
+/**
+ * Effective runtime configuration. Precedence:
+ *
+ *   server:  CLI --server → stored credential → SERVER_URL env → http://localhost:3000
+ *   token:   secure store (file/keychain) → DEVICE_TOKEN/DEVICE_ID env → none
+ *
+ * There is deliberately no --token CLI flag: a token on the command line would
+ * leak into shell history and process listings. Use `save-token` once, then the
+ * secure store owns the credential.
+ */
+export async function loadRuntimeConfig(overrides: { serverUrl?: string } = {}): Promise<RuntimeConfig> {
+  const creds = await loadCredentials();
+  const serverUrl = cleanServerUrl(overrides.serverUrl ?? creds?.serverUrl ?? process.env.SERVER_URL);
+  let credentialLocation = "environment (DEVICE_TOKEN / DEVICE_ID)";
+  if (creds && creds.backend !== "env") {
+    try {
+      credentialLocation = `${creds.backend} (${resolveCredentialStore().location})`;
+    } catch {
+      credentialLocation = creds.backend;
+    }
+  }
+  return {
+    serverUrl,
+    deviceToken: creds?.deviceToken ?? null,
+    deviceId: creds?.deviceId ?? null,
+    credentialBackend: creds?.backend ?? null,
+    credentialLocation,
+  };
+}

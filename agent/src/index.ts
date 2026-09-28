@@ -9,8 +9,10 @@
  *   npm run dev          # tsx watch (development)
  *   npm start            # node dist/index.js (production)
  *   npm start -- --pair <CODE>   # one-shot pairing, then exit (see cli.ts)
+ *
+ * Credentials resolve via loadRuntimeConfig: secure store → environment.
  */
-import { config } from "./config/index.js";
+import { config, loadRuntimeConfig } from "./config/index.js";
 import { AgentStore } from "./state/store.js";
 import { CommandExecutor } from "./executor/index.js";
 import { ControlPlaneClient } from "./transport/client.js";
@@ -44,21 +46,30 @@ async function maybePairAndExit(): Promise<boolean> {
   process.exit(0);
 }
 
+function cliFlag(name: string): string | undefined {
+  const argv = process.argv.slice(2);
+  const at = argv.findIndex((a) => a === name);
+  if (at === -1) return undefined;
+  const value = argv[at + 1];
+  return value && !value.startsWith("--") ? value : undefined;
+}
+
 async function main() {
   if (await maybePairAndExit()) return;
 
-  const token = config.deviceToken;
-  const deviceId = config.deviceId;
+  const runtime = await loadRuntimeConfig({ serverUrl: cliFlag("--server") });
+  const token = runtime.deviceToken;
+  const deviceId = runtime.deviceId;
   if (!token || !deviceId) {
     fail(
-      "DEVICE_TOKEN / DEVICE_ID are not configured.\n" +
+      `No device credential found (${runtime.credentialLocation}).\n` +
         "Pair this machine first:\n" +
-        "  npm run pair -- --code <PAIRING_CODE> --name \"My Windows PC\"\n" +
+        '  npm run pair -- --code <PAIRING_CODE> --name "My Windows PC"\n' +
         "Get the code from Devices → Add device in the Control Center.",
     );
   }
 
-  log(`[agent] starting (phase-1 dry-run) → ${config.serverUrl} · device=${deviceId.slice(0, 8)}… · DRY_RUN=${config.dryRun ? "1" : "0"}`);
+  log(`[agent] starting (phase-1 dry-run) → ${runtime.serverUrl} · device=${deviceId.slice(0, 8)}… · DRY_RUN=${config.dryRun ? "1" : "0"} · creds=${runtime.credentialBackend}`);
   if (config.applicationProfiles.length) {
     log(`[agent] local application profiles: ${config.applicationProfiles.length} configured`);
   } else {
@@ -66,12 +77,12 @@ async function main() {
   }
 
   const store = new AgentStore();
-  const client = new ControlPlaneClient(config.serverUrl, () => config.deviceToken);
+  const client = new ControlPlaneClient(runtime.serverUrl, () => token);
   const executor = new CommandExecutor({ client, store, profiles: config.applicationProfiles, forceDryRun: config.dryRun, log });
   const reporter = new Reporter({ client, store, heartbeatMs: config.heartbeatMs, stateMs: config.stateReportMs, log });
   const events = new SseConnection({
-    baseUrl: config.serverUrl,
-    getToken: () => config.deviceToken,
+    baseUrl: runtime.serverUrl,
+    getToken: () => token,
     log,
     handlers: {
       onHello: (payload) => {

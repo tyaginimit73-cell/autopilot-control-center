@@ -10,6 +10,7 @@
     "start": "node dist/index.js",
     "pair": "node dist/cli.js pair",
     "save-token": "node dist/cli.js save-token",
+    "doctor": "node dist/cli.js doctor",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test src/test/*.test.ts"

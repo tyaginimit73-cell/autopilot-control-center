@@ -9,6 +9,11 @@ coverage/
 .env.local
 .env.*.local
 
+# Phase 2: agent credential-store files must never be committed, even via
+# an AUTOPILOT_CREDENTIALS_FILE override that points inside the repo.
+credentials.json
+.autopilot-agent/
+
 .pki/
 .sudo_as_admin_successful
 

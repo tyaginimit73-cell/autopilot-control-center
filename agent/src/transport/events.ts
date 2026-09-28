@@ -180,7 +180,11 @@ export class SseConnection {
     const res = await fetch(`${this.opts.baseUrl}/api/agent/events`, { headers, signal });
     if (!res.ok || !res.body) {
       const body = await res.text().catch(() => "").then((t) => t.slice(0, 200));
-      throw new Error(`event stream rejected (HTTP ${res.status})${body ? `: ${body}` : ""}`);
+      const hint =
+        res.status === 401 || res.status === 403
+          ? " — token invalid or rotated; update it with `save-token` (after Devices → Rotate) then restart"
+          : "";
+      throw new Error(`event stream rejected (HTTP ${res.status})${body ? `: ${body}` : ""}${hint}`);
     }
     const contentType = res.headers.get("content-type") ?? "";
     if (!contentType.includes("text/event-stream")) {

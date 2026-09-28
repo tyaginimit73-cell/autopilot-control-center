@@ -53,7 +53,11 @@ export class Reporter {
       await this.opts.client.post("/api/agent/heartbeat", { status: "ONLINE" });
       this.opts.store.lastHeartbeatAt = new Date().toISOString();
     } catch (error) {
-      this.opts.log?.(`[agent] heartbeat failed: ${(error as Error).message}`);
+      // 401/403 almost always means the stored token was rotated or revoked:
+      // point at the recovery workflow (the secret itself is never logged).
+      const status = (error as { status?: unknown }).status;
+      const hint = status === 401 || status === 403 ? " — token rejected; if it was rotated, run save-token with the new secret and restart" : "";
+      this.opts.log?.(`[agent] heartbeat failed: ${(error as Error).message}${hint}`);
     } finally {
       this.heartbeatInFlight = false;
     }
