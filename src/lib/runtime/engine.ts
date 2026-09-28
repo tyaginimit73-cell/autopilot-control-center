@@ -1,8 +1,9 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { db } from "@/db";
 import { activityLogs, devices, workflowExecutions, workflows } from "@/db/schema";
 import { log, publish } from "@/lib/events";
 import { ApiError } from "@/lib/http";
+import { describeActionSafe } from "@/lib/runtime/safe-log";
 import {
   captureAction,
   controlsForDevice,
@@ -83,8 +84,17 @@ function buildCommand(opts: DispatchOptions, id = crypto.randomUUID()): AgentCom
     dryRun: opts.dryRun,
     type: opts.type,
     parameters: opts.parameters ?? {},
-    timeoutMs: opts.timeoutMs ?? ACTION_CATALOG[opts.type]?.control ? 30_000 : 15_000,
+    timeoutMs: resolveCommandTimeoutMs(opts.type, opts.timeoutMs),
   };
+}
+
+/**
+ * Timeout precedence: an explicit per-action timeout always wins; otherwise
+ * control-flow actions get 30 s and everything else 15 s.
+ */
+export function resolveCommandTimeoutMs(type: ActionType, explicit?: number): number {
+  if (typeof explicit === "number" && Number.isFinite(explicit)) return explicit;
+  return ACTION_CATALOG[type]?.control ? 30_000 : 15_000;
 }
 
 /** Single ad-hoc command (mouse pad, keyboard pad, browser toolbar, window card…). */
@@ -112,7 +122,7 @@ export async function dispatchCommand(opts: DispatchOptions): Promise<AgentComma
     deviceId: opts.deviceId,
     executionId: opts.executionId ?? null,
     level: result.ok ? (opts.dryRun ? "DEBUG" : "SUCCESS") : "ERROR",
-    message: `${opts.dryRun ? "[DRY RUN] " : ""}${definition.summary(opts.parameters)} — ${result.message}`,
+    message: `${opts.dryRun ? "[DRY RUN] " : ""}${describeActionSafe(opts.type, opts.parameters)} — ${result.message}`,
     actionType: opts.type,
     meta: { durationMs: result.durationMs, commandId: result.commandId },
   });
@@ -232,6 +242,9 @@ async function runLoop(input: LoopInput) {
   const { actions, control, link } = input;
   const startedAll = Date.now();
   const steps = [...control.stepsSnapshot] as ExecutionStep[];
+  // Wire the live array into the control: finalise() persists stepsSnapshot,
+  // so without this every run ends with the pristine all-PENDING timeline.
+  attachSteps(control, steps);
 
   let index = 0;
   while (index < actions.length) {
@@ -270,6 +283,29 @@ async function runLoop(input: LoopInput) {
         updateStep(steps, index, { status: "SKIPPED", message: "cancelled" });
         await progress(input.executionId, index, steps);
         await finalise(input.executionId, input.userId, input.deviceId, input.workflowId, input.workflowName, control.aborted ? "STOPPED" : "FAILED", message === "ABORTED" ? "Cancelled" : message, control, link);
+        return;
+      }
+      if (message === STOP_SENTINEL) {
+        // Explicit STOP: an authored early exit, not a failure. The run is
+        // COMPLETE (remaining steps never ran and stay PENDING), which keeps it
+        // distinct from STOPPED (external cancellation) and FAILED (error).
+        updateStep(steps, index, { status: "COMPLETED", message: "stopped early by STOP action" });
+        await progress(input.executionId, index, steps);
+        publish(
+          "action:completed",
+          { executionId: input.executionId, index, total: actions.length, actionId: action.id, actionType: action.type, message: describe(action) },
+          input.userId,
+        );
+        await log({
+          userId: input.userId,
+          deviceId: input.deviceId,
+          workflowId: input.workflowId,
+          executionId: input.executionId,
+          level: "INFO",
+          message: `Workflow stopped early by STOP action at step ${index + 1} of ${actions.length}`,
+          actionType: "STOP",
+        });
+        await finalise(input.executionId, input.userId, input.deviceId, input.workflowId, input.workflowName, "COMPLETED", null, control, link);
         return;
       }
       updateStep(steps, index, { status: "FAILED", message });
@@ -314,7 +350,7 @@ async function runAction(input: LoopInput, action: WorkflowAction, index: number
         await sleep(Math.min(action.parameters.milliseconds ?? 1000, 600_000), input.control.abortController.signal);
         return;
       case "STOP":
-        throw new Error("__STOP__");
+        throw new Error(STOP_SENTINEL);
       case "CONDITION": {
         const pass = evaluateCondition(action.parameters, input.deviceId);
         await log({
@@ -426,9 +462,11 @@ function evaluateCondition(params: ActionParams, deviceId: string): boolean {
   }
 }
 
+/** Log/SSE-safe description — never contains typed text, form values or URL secrets. */
+export const STOP_SENTINEL = "__STOP__";
+
 function describe(action: WorkflowAction) {
-  const def = ACTION_CATALOG[action.type];
-  return def ? def.summary(action.parameters ?? {}) : action.type;
+  return describeActionSafe(action.type, action.parameters ?? {});
 }
 
 function updateStep(steps: ExecutionStep[], index: number, patch: Partial<ExecutionStep>) {
@@ -467,7 +505,11 @@ async function finalise(
   }
   busyDevices.delete(deviceId);
   updateAutomationState(deviceId, "IDLE");
-  link.emergencyStop();
+  // Propagate cancellation to the agent ONLY when the run was cancelled
+  // externally (user stop / emergency stop). COMPLETED and FAILED runs have no
+  // in-flight work left, so signalling emergency-stop there would wrongly halt
+  // the agent after every normal workflow.
+  if (status === "STOPPED") link.emergencyStop();
   releaseControl(executionId);
 
   const event = status === "COMPLETED" ? "workflow:completed" : status === "FAILED" ? "workflow:failed" : "workflow:stopped";
@@ -496,7 +538,7 @@ export function pauseExecution(executionId: string) {
   control.status = "PAUSED";
   updateAutomationState(control.deviceId, "PAUSED");
   publish("workflow:paused", { executionId, deviceId: control.deviceId, workflowId: "", workflowName: "" }, control.userId);
-  void db.update(workflowExecutions).set({ status: "PAUSED", updatedAt: new Date() }).where(eq(workflowExecutions.id, executionId));
+  void db.update(workflowExecutions).set({ status: "PAUSED", updatedAt: new Date() }).where(eq(workflowExecutions.id, executionId)).execute().catch(() => undefined);
   void log({ userId: control.userId, deviceId: control.deviceId, executionId, level: "WARN", message: "Execution paused" });
   return control;
 }
@@ -507,7 +549,7 @@ export function resumeExecution(executionId: string) {
   control.status = "RUNNING";
   updateAutomationState(control.deviceId, "RUNNING");
   publish("workflow:resumed", { executionId, deviceId: control.deviceId, workflowId: "", workflowName: "" }, control.userId);
-  void db.update(workflowExecutions).set({ status: "RUNNING", updatedAt: new Date() }).where(eq(workflowExecutions.id, executionId));
+  void db.update(workflowExecutions).set({ status: "RUNNING", updatedAt: new Date() }).where(eq(workflowExecutions.id, executionId)).execute().catch(() => undefined);
   void log({ userId: control.userId, deviceId: control.deviceId, executionId, level: "INFO", message: "Execution resumed" });
   return control;
 }
@@ -515,7 +557,7 @@ export function resumeExecution(executionId: string) {
 export function stopExecution(executionId: string, reason = "Stopped from the dashboard") {
   const control = getControl(executionId);
   if (!control) {
-    void db.update(workflowExecutions).set({ status: "STOPPED", finishedAt: new Date(), error: reason }).where(eq(workflowExecutions.id, executionId));
+    void db.update(workflowExecutions).set({ status: "STOPPED", finishedAt: new Date(), error: reason }).where(eq(workflowExecutions.id, executionId)).execute().catch(() => undefined);
     return { stopped: 0 };
   }
   control.aborted = true;
@@ -555,8 +597,18 @@ async function activeIds(userId: string, deviceId?: string) {
   const rows = await db
     .select({ id: workflowExecutions.id, deviceId: workflowExecutions.deviceId })
     .from(workflowExecutions)
-    .where(and(eq(workflowExecutions.userId, userId), eq(workflowExecutions.status, "RUNNING")));
+    .where(and(eq(workflowExecutions.userId, userId), inArray(workflowExecutions.status, ["RUNNING", "PAUSED"])));
   return rows.filter((r) => !deviceId || r.deviceId === deviceId).map((r) => r.id);
+}
+
+/** True while any execution of the workflow is still alive (RUNNING or PAUSED). */
+export async function workflowHasActiveExecution(workflowId: string): Promise<boolean> {
+  const rows = await db
+    .select({ id: workflowExecutions.id })
+    .from(workflowExecutions)
+    .where(and(eq(workflowExecutions.workflowId, workflowId), inArray(workflowExecutions.status, ["RUNNING", "PAUSED"])))
+    .limit(1);
+  return rows.length > 0;
 }
 
 /** Wires the execution's step snapshot so pause/resume/finalise can mutate it. */
@@ -568,7 +620,7 @@ export function attachSteps(control: ReturnType<typeof createControl>, steps: Ex
 export function normaliseError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   if (!message) return "Unknown device error";
-  if (message.includes("__STOP__")) return "__STOP__";
+  if (message.includes(STOP_SENTINEL)) return STOP_SENTINEL;
   if (message === "ABORTED") return "ABORTED";
   if (error instanceof ApiError) return message;
   return message.length > 240 ? `${message.slice(0, 240)}…` : message;

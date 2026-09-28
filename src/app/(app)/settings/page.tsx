@@ -219,7 +219,7 @@ export default function SettingsPage() {
       <Card className="p-5">
         <PanelHeader title="Browser & agent runtime" subtitle="Environment variables the agent reads — the dashboard never sees them" icon={<Globe className="size-4" />} />
         <div className="grid gap-3 lg:grid-cols-2">
-          <Code title="agent/.env" body={`SERVER_URL=${typeof window !== "undefined" ? window.location.origin.replace("5173", "4000") : "http://localhost:4000"}\nDEVICE_TOKEN=<shown once after pairing>\nDEVICE_ID=<id printed after pairing>\nDRY_RUN=1\nHEADLESS=0\nBROWSER_CDP_URL=\nEMERGENCY_SHORTCODE=Ctrl+Shift+Esc`} />
+          <Code title="agent/.env" body={`SERVER_URL=${typeof window !== "undefined" ? window.location.origin : "http://localhost:3000"}\nDEVICE_TOKEN=<shown once after pairing>\nDEVICE_ID=<id printed after pairing>\nDRY_RUN=1\nHEADLESS=0\nBROWSER_CDP_URL=\nEMERGENCY_SHORTCUT=Ctrl+Shift+Esc`} />
           <div className="space-y-2.5">
             <p className="text-[0.76rem] leading-relaxed text-mist-500">
               <span className="text-mist-300">DRY_RUN=1</span> keeps the agent in safe mode even if a caller requests a live command — the reverse is never true:

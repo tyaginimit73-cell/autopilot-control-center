@@ -1,4 +1,4 @@
-import { and, eq, gte } from "drizzle-orm";
+import { and, eq, isNull, lt, or } from "drizzle-orm";
 import { db } from "@/db";
 import { devices } from "@/db/schema";
 import { log, publish } from "@/lib/events";
@@ -27,16 +27,20 @@ interface AgentSocket {
   closed: boolean;
 }
 
+interface PendingEntry {
+  deviceId: string;
+  resolve: (r: AgentCommandResult) => void;
+  reject: (e: Error) => void;
+  timer: NodeJS.Timeout;
+}
+
 const globalForGateway = globalThis as typeof globalThis & {
   __autopilotAgentSockets?: Map<string, AgentSocket>;
-  __autopilotAgentPending?: Map<string, { resolve: (r: AgentCommandResult) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>;
+  __autopilotAgentPending?: Map<string, PendingEntry>;
 };
 
 const sockets = (globalForGateway.__autopilotAgentSockets ??= new Map<string, AgentSocket>());
-const pending = (globalForGateway.__autopilotAgentPending ??= new Map<
-  string,
-  { resolve: (r: AgentCommandResult) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }
->());
+const pending = (globalForGateway.__autopilotAgentPending ??= new Map<string, PendingEntry>());
 
 class RemoteAgentLink implements DeviceLink {
   readonly kind = "WINDOWS_AGENT" as const;
@@ -49,7 +53,7 @@ class RemoteAgentLink implements DeviceLink {
         pending.delete(command.id);
         resolve({ commandId: command.id, ok: false, message: ERROR_MESSAGES.TIMEOUT, durationMs: command.timeoutMs });
       }, Math.max(command.timeoutMs, 1_000));
-      pending.set(command.id, { resolve, reject, timer });
+      pending.set(command.id, { deviceId: this.deviceId, resolve, reject, timer });
       this.socket.write("command", command);
     });
   }
@@ -67,11 +71,14 @@ class RemoteAgentLink implements DeviceLink {
   }
 
   close() {
-    for (const [, entry] of pending) {
+    // Device-scoped cleanup: disconnecting this device must never disturb
+    // in-flight commands belonging to other devices.
+    for (const [id, entry] of pending) {
+      if (entry.deviceId !== this.deviceId) continue;
       clearTimeout(entry.timer);
+      pending.delete(id);
       entry.reject(new Error(ERROR_MESSAGES.AGENT_OFFLINE));
     }
-    pending.clear();
   }
 }
 
@@ -140,9 +147,10 @@ export async function touchHeartbeat(deviceId: string, extra?: { activeWindow?: 
   }
 }
 
-export function resolveResult(commandId: string, result: AgentCommandResult) {
+export function resolveResult(deviceId: string, commandId: string, result: AgentCommandResult) {
   const entry = pending.get(commandId);
-  if (!entry) return false;
+  // Ownership check: a device may only resolve its own commands.
+  if (!entry || entry.deviceId !== deviceId) return false;
   clearTimeout(entry.timer);
   pending.delete(commandId);
   entry.resolve(result);
@@ -186,7 +194,9 @@ export async function applyAgentState(
       runtime.userId,
     );
   }
-  if (typeof patch.typedBuffer === "string") state.typedBuffer = patch.typedBuffer;
+  // `typedBuffer` is deliberately NOT ingested: raw keystroke content must never
+  // travel from an agent into server memory, let alone the dashboard. The field
+  // stays accepted by the schema for backward compatibility and is ignored here.
   if (patch.automation) state.automation = patch.automation;
 }
 
@@ -201,8 +211,21 @@ export async function applyRecorderEvent(deviceId: string, event: { type: Action
 
 export async function staleDevices() {
   const cutoff = new Date(Date.now() - HEARTBEAT_TIMEOUT_MS);
-  const rows = await db.select().from(devices).where(and(eq(devices.status, "ONLINE"), gte(devices.lastSeen, new Date(0))));
-  return rows.filter((row) => (!row.lastSeen ? true : row.lastSeen < cutoff)).map((row) => ({ id: row.id, userId: row.userId }));
+  // NULL-safe: a NULL lastSeen satisfies the stale predicate in SQL instead of
+  // being filtered out before the JS fallback could see it. Simulated devices
+  // are excluded: they are in-process (no heartbeats by design) and the health
+  // monitor already owns their ONLINE/OFFLINE lifecycle.
+  const rows = await db
+    .select()
+    .from(devices)
+    .where(
+      and(
+        eq(devices.status, "ONLINE"),
+        eq(devices.kind, "WINDOWS_AGENT"),
+        or(isNull(devices.lastSeen), lt(devices.lastSeen, cutoff)),
+      ),
+    );
+  return rows.map((row) => ({ id: row.id, userId: row.userId }));
 }
 
 export { devices };

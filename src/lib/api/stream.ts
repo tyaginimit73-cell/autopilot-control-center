@@ -163,7 +163,7 @@ export const streamHandlers = {
         data: z.record(z.string(), z.unknown()).optional(),
       }),
     );
-    const matched = resolveResult(input.commandId, input);
+    const matched = resolveResult(agent.deviceId, input.commandId, input);
     publish("agent:result", { deviceId: agent.deviceId, ...input }, agent.userId);
     return json({ ok: true, matched });
   },

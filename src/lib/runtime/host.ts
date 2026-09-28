@@ -65,10 +65,19 @@ export const runtimes: Map<string, DeviceRuntime> = (globalForHost.__autopilotRu
 export const activeExecutions: Map<string, ExecutionControl> = (globalForHost.__autopilotExecutions ??= new Map());
 export const recorderSessions: Map<string, RecorderSession> = (globalForHost.__autopilotRecorders ??= new Map());
 
+function parseResolution(resolution: string): { w: number; h: number } {
+  const [w, h] = resolution.split("x").map((v) => Number.parseInt(v, 10));
+  return {
+    w: Number.isFinite(w) && w > 0 ? w : 1920,
+    h: Number.isFinite(h) && h > 0 ? h : 1080,
+  };
+}
+
 export function emptyState(deviceId: string, resolution = "1920x1080"): SystemState {
+  const { w, h } = parseResolution(resolution);
   return {
     deviceId,
-    mouse: { x: 960, y: 540, screenW: 1920, screenH: parseInt(resolution.split("x")[0] ?? "1920", 10) || 1920, at: Date.now() },
+    mouse: { x: Math.round(w / 2), y: Math.round(h / 2), screenW: w, screenH: h, at: Date.now() },
     activeWindow: null,
     windows: [],
     tabs: [],

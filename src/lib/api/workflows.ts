@@ -12,12 +12,12 @@ import {
 } from "@autopilot/shared";
 import type { WorkflowAction } from "@autopilot/shared";
 import {
-  deviceHasActiveExecution,
   emergencyStop,
   pauseExecution,
   resumeExecution,
   startWorkflow,
   stopExecution,
+  workflowHasActiveExecution,
 } from "@/lib/runtime/engine";
 import { ensureSimulatedDevice } from "@/lib/runtime/index";
 import { runtimeForUser } from "@/lib/runtime/host";
@@ -123,7 +123,7 @@ export const workflowHandlers = {
   async remove(ctx: Ctx) {
     const [existing] = await db.select().from(workflows).where(and(eq(workflows.id, ctx.params.id), eq(workflows.userId, ctx.user.id)));
     if (!existing) throw new ApiError(404, "Workflow not found");
-    if (deviceHasActiveExecution(existing.id)) throw new ApiError(409, "Stop the running execution before deleting this workflow");
+    if (await workflowHasActiveExecution(ctx.params.id)) throw new ApiError(409, "Stop the running execution before deleting this workflow");
     await db.delete(workflows).where(eq(workflows.id, ctx.params.id));
     return json({ ok: true });
   },
@@ -248,13 +248,18 @@ export const workflowHandlers = {
     const [workflow] = await db.select().from(workflows).where(and(eq(workflows.id, input.workflowId), eq(workflows.userId, ctx.user.id)));
     if (!workflow) throw new ApiError(404, "Workflow not found");
     if (input.frequency === "CRON" && !input.cron) throw new ApiError(422, "A cron expression is required for custom schedules");
-    if (input.frequency === "ONCE" && !input.runAt) throw new ApiError(422, "Pick a date and time for a one-off run");
+    const runAt = input.runAt ? new Date(input.runAt) : null;
+    if (input.frequency === "ONCE") {
+      if (!runAt || Number.isNaN(runAt.getTime())) throw new ApiError(422, "Pick a valid date and time for a one-off run");
+      if (runAt <= new Date()) throw new ApiError(422, "Pick a future date and time for a one-off run");
+    }
     const row = {
       frequency: input.frequency,
       timeOfDay: input.timeOfDay,
       dayOfWeek: input.dayOfWeek ?? null,
       intervalMinutes: input.intervalMinutes ?? null,
       cron: input.cron ?? null,
+      runAt,
       lastRunAt: null,
       nextRunAt: null,
     } as never;
@@ -272,7 +277,7 @@ export const workflowHandlers = {
         dayOfWeek: input.dayOfWeek ?? null,
         intervalMinutes: input.intervalMinutes ?? null,
         cron: input.cron ?? null,
-        runAt: input.runAt ? new Date(input.runAt) : null,
+        runAt,
         enabled: input.enabled,
         misfirePolicy: input.misfirePolicy,
         dryRun: input.dryRun,
